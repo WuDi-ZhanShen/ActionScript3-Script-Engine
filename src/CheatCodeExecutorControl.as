@@ -117,6 +117,10 @@ package
       
       private var _knownDomains:Array = [];
       
+      private var _currentExecContext:String = "";
+      
+      private var _lastExecContext:String = "";
+      
       public function CheatCodeExecutorControl()
       {
          super();
@@ -134,7 +138,7 @@ package
       
       private function isPkgChain(v:*) : Boolean
       {
-         return v != null && v is Object && Object(v).hasOwnProperty(PKGCHAIN_TAG) && Object(v)[PKGCHAIN_TAG] === true;
+         return v != null && v is Object && Boolean(Object(v).hasOwnProperty(PKGCHAIN_TAG)) && Object(v)[PKGCHAIN_TAG] === true;
       }
       
       private function consumeValue(v:*, logOnFail:Boolean) : *
@@ -389,7 +393,18 @@ package
          }
          catch(err:Error)
          {
-            CheatPanel.log("代码执行器：执行过程中异常：\n" + err.name + ": " + err.message);
+            var detail:String = "代码执行器：执行过程中异常：\n" + err.name + ": " + err.message;
+            var context:String = getExecutionContext();
+            if(context.length > 0)
+            {
+               detail += "\n执行位置：" + context;
+            }
+            var stack:String = err.getStackTrace();
+            if(stack != null && stack.length > 0)
+            {
+               detail += "\n" + stack;
+            }
+            CheatPanel.log(detail);
          }
       }
       
@@ -401,10 +416,80 @@ package
          _importMap = {};
          _classCache = {};
          _classResolveCache = {};
+         _currentExecContext = "";
+         _lastExecContext = "";
          refreshKnownDomains();
          var tokens:Array = tokenize(cmd);
          var ast:Object = parseProgram(tokens);
          runProgram(ast);
+      }
+      
+      private function setExecutionContext(value:String) : void
+      {
+         _currentExecContext = value == null ? "" : value;
+         if(_currentExecContext.length > 0)
+         {
+            _lastExecContext = _currentExecContext;
+         }
+      }
+      
+      private function getExecutionContext() : String
+      {
+         if(_currentExecContext != null && _currentExecContext.length > 0)
+         {
+            return _currentExecContext;
+         }
+         return _lastExecContext == null ? "" : _lastExecContext;
+      }
+      
+      private function safeExprText(node:Object) : String
+      {
+         if(node == null)
+         {
+            return "";
+         }
+         try
+         {
+            return exprToString(node);
+         }
+         catch(err:Error)
+         {
+         }
+         try
+         {
+            return buildChainString(node);
+         }
+         catch(err2:Error)
+         {
+         }
+         return String(node.type);
+      }
+      
+      private function statementText(node:Object) : String
+      {
+         if(node == null)
+         {
+            return "";
+         }
+         switch(String(node.type))
+         {
+            case "VarDecl":
+               return "var " + node.name + (node.init != null ? " = " + safeExprText(node.init) : "");
+            case "Assign":
+               return safeExprText(node.left) + " = " + safeExprText(node.right);
+            case "ExprStmt":
+               return safeExprText(node.expr);
+            case "If":
+               return "if (" + safeExprText(node.test) + ")";
+            case "While":
+               return "while (" + safeExprText(node.test) + ")";
+            case "FunctionDecl":
+               return "function " + node.name + "(...)";
+            case "Return":
+               return "return " + (node.arg != null ? safeExprText(node.arg) : "");
+            default:
+               return String(node.type);
+         }
       }
       
       private function tokenize(src:String) : Array
@@ -433,13 +518,15 @@ package
             }
             else if(ch >= "0" && ch <= "9" || ch == "." && i + 1 < src.length && src.charAt(i + 1) >= "0" && src.charAt(i + 1) <= "9")
             {
+               var j:int;
+               var cj:String;
                if(ch == "0" && i + 1 < src.length && (src.charAt(i + 1) == "x" || src.charAt(i + 1) == "X"))
                {
-                  var j:int = i + 2;
+                  j = i + 2;
                   while(j < src.length)
                   {
-                     var cj:String = src.charAt(j);
-                     if(!(cj >= "0" && cj <= "9" || cj >= "a" && cj <= "f" || cj >= "A" && cj <= "F"))
+                     cj = src.charAt(j);
+                     if(!((cj >= "0" && cj <= "9") || (cj >= "a" && cj <= "f") || (cj >= "A" && cj <= "F")))
                      {
                         break;
                      }
@@ -457,24 +544,25 @@ package
                      if(cj >= "0" && cj <= "9")
                      {
                         j++;
+                        continue;
                      }
-                     else if(cj == "." && !sawDot && !sawExp)
+                     if(cj == "." && !sawDot && !sawExp)
                      {
                         sawDot = true;
                         j++;
+                        continue;
                      }
-                     else
+                     if((cj == "e" || cj == "E") && !sawExp)
                      {
-                        if(!((cj == "e" || cj == "E") && !sawExp))
-                        {
-                           break;
-                        }
                         sawExp = true;
-                        if(++j < src.length && (src.charAt(j) == "+" || src.charAt(j) == "-"))
+                        j++;
+                        if(j < src.length && (src.charAt(j) == "+" || src.charAt(j) == "-"))
                         {
                            j++;
                         }
+                        continue;
                      }
+                     break;
                   }
                }
                tokens.push({
@@ -886,6 +974,7 @@ package
       private function parsePrimary() : Object
       {
          var t:Object = peek();
+         var node:Object;
          if(t.type == TK_KW && t.value == "new")
          {
             nextTok();
@@ -905,12 +994,8 @@ package
                      "prop":propTok.value
                   };
                }
-               else
+               else if(match(TK_PUNC,"["))
                {
-                  if(!match(TK_PUNC,"["))
-                  {
-                     break;
-                  }
                   var indexExpr:Object = parseExpression();
                   expect(TK_PUNC,"]");
                   target = {
@@ -918,6 +1003,10 @@ package
                      "object":target,
                      "index":indexExpr
                   };
+               }
+               else
+               {
+                  break;
                }
             }
             var args:Array = [];
@@ -933,7 +1022,7 @@ package
                   expect(TK_PUNC,")");
                }
             }
-            var node:Object = {
+            node = {
                "type":"New",
                "callee":target,
                "args":args
@@ -945,7 +1034,7 @@ package
             var numberText:String = String(t.value);
             node = {
                "type":"Literal",
-               "value":(numberText.length > 2 && numberText.charAt(0) == "0" && (numberText.charAt(1) == "x" || numberText.charAt(1) == "X") ? parseInt(numberText.substr(2),16) : Number(numberText))
+               "value":(numberText.length > 2 && numberText.charAt(0) == "0" && (numberText.charAt(1) == "x" || numberText.charAt(1) == "X") ? Number(parseInt(numberText.substr(2),16)) : Number(numberText))
             };
             return parsePostfix(node);
          }
@@ -960,9 +1049,10 @@ package
          if(t.type == TK_KW && (t.value == "true" || t.value == "false" || t.value == "null" || t.value == "undefined"))
          {
             nextTok();
+            var v:*;
             if(t.value == "true")
             {
-               var v:* = true;
+               v = true;
             }
             else if(t.value == "false")
             {
@@ -1037,12 +1127,8 @@ package
                   "index":ie
                };
             }
-            else
+            else if(match(TK_PUNC,"("))
             {
-               if(!match(TK_PUNC,"("))
-               {
-                  break;
-               }
                var a:Array = [];
                if(!match(TK_PUNC,")"))
                {
@@ -1058,6 +1144,10 @@ package
                   "callee":node,
                   "args":a
                };
+            }
+            else
+            {
+               break;
             }
          }
          return node;
@@ -1113,14 +1203,16 @@ package
                if(fr.i >= fr.stmts.length)
                {
                   _frames.pop();
-                  break;
                }
-               _frames.push({
-                  "type":"StmtFrame",
-                  "node":fr.stmts[fr.i++],
-                  "state":0,
-                  "inFunction":fr.inFunction
-               });
+               else
+               {
+                  _frames.push({
+                     "type":"StmtFrame",
+                     "node":fr.stmts[fr.i++],
+                     "state":0,
+                     "inFunction":fr.inFunction
+                  });
+               }
                break;
             case "StmtFrame":
                tickStmtFrame(fr);
@@ -1150,6 +1242,7 @@ package
       private function tickStmtFrame(fr:Object) : Boolean
       {
          var s:Object = fr.node;
+         setExecutionContext("语句：" + statementText(s));
          switch(s.type)
          {
             case "ImportDecl":
@@ -1512,13 +1605,11 @@ package
       
       private function hasDefinitionDeep(domain:ApplicationDomain, name:String) : Boolean
       {
-         var d:ApplicationDomain;
-         var i:int;
          if(name == null || name.length == 0)
          {
             return false;
          }
-         d = domain;
+         var d:ApplicationDomain = domain;
          while(d)
          {
             try
@@ -1537,7 +1628,7 @@ package
          {
             refreshKnownDomains();
          }
-         i = 0;
+         var i:int = 0;
          while(i < _knownDomains.length)
          {
             d = _knownDomains[i] as ApplicationDomain;
@@ -1553,6 +1644,7 @@ package
             }
             i++;
          }
+         // 子 SWF 可能在脚本执行期间刚加载完成，未命中时刷新一次。
          refreshKnownDomains();
          i = 0;
          while(i < _knownDomains.length)
@@ -1575,7 +1667,6 @@ package
       
       private function getDefinitionDeep(domain:ApplicationDomain, name:String) : *
       {
-         var i:int;
          var d:ApplicationDomain = domain;
          while(d)
          {
@@ -1595,7 +1686,7 @@ package
          {
             refreshKnownDomains();
          }
-         i = 0;
+         var i:int = 0;
          while(i < _knownDomains.length)
          {
             d = _knownDomains[i] as ApplicationDomain;
@@ -1663,8 +1754,6 @@ package
       
       private function collectDomainsFromDisplayTree(obj:DisplayObject, seenObjects:Dictionary, seenDomains:Dictionary) : void
       {
-         var container:DisplayObjectContainer;
-         var i:int;
          if(obj == null || seenObjects[obj])
          {
             return;
@@ -1680,12 +1769,12 @@ package
          catch(err:Error)
          {
          }
-         container = obj as DisplayObjectContainer;
+         var container:DisplayObjectContainer = obj as DisplayObjectContainer;
          if(container == null)
          {
             return;
          }
-         i = 0;
+         var i:int = 0;
          while(i < container.numChildren)
          {
             try
@@ -1707,7 +1796,17 @@ package
       
       private function tickEvalFrame(fr:Object) : Boolean
       {
+         var av:*;
+         var b:*;
+         var a:*;
+         var obj:*;
+         var idxVal:*;
+         var base:*;
+         var ni:int;
+         var _loc3_:*;
+         var _loc4_:*;
          var e:Object = fr.node;
+         setExecutionContext("表达式：" + safeExprText(e));
          switch(e.type)
          {
             case "Literal":
@@ -1734,15 +1833,14 @@ package
                      "node":e.elements[fr.idx],
                      "state":0
                   });
-                  var _loc3_:* = fr;
-                  var _loc4_:* = Number(_loc3_.idx) + 1;
+                  _loc3_ = fr;
+                  _loc4_ = Number(_loc3_.idx) + 1;
                   _loc3_.idx = _loc4_;
                   return true;
                }
                _frames.pop();
                pushValue(fr.arr);
                return false;
-               break;
             case "Unary":
                if(fr.state == 0)
                {
@@ -1755,11 +1853,10 @@ package
                   });
                   return true;
                }
-               var av:* = consumeValue(popValue(),true);
+               av = consumeValue(popValue(),true);
                _frames.pop();
                pushValue(fr.op == "!" ? !truthy(av) : -Number(av));
                return false;
-               break;
             case "Binary":
                if(fr.state == 0)
                {
@@ -1785,12 +1882,11 @@ package
                   });
                   return true;
                }
-               var b:* = consumeValue(popValue(),true);
-               var a:* = fr.a;
+               b = consumeValue(popValue(),true);
+               a = fr.a;
                _frames.pop();
                pushValue(evalBinary(fr.op,a,b));
                return false;
-               break;
             case "Name":
                _frames.pop();
                pushValue(evalName(e.value));
@@ -1808,7 +1904,7 @@ package
                   });
                   return true;
                }
-               var obj:* = popValue();
+               obj = popValue();
                if(isPkgChain(obj))
                {
                   _frames.pop();
@@ -1831,7 +1927,6 @@ package
                _frames.pop();
                pushValue(readMemberValue(obj,fr.prop,buildChainString(e)));
                return false;
-               break;
             case "Index":
                if(fr.state == 0)
                {
@@ -1856,8 +1951,8 @@ package
                   });
                   return true;
                }
-               var idxVal:* = consumeValue(popValue(),true);
-               var base:* = fr.base;
+               idxVal = consumeValue(popValue(),true);
+               base = fr.base;
                if(isPkgChain(base))
                {
                   base = consumeValue(base,true);
@@ -1877,7 +1972,6 @@ package
                _frames.pop();
                pushValue(readMemberValue(base,idxVal,buildChainString(e)));
                return false;
-               break;
             case "New":
                if(fr.state == 0)
                {
@@ -1914,7 +2008,7 @@ package
                      return true;
                   }
                   _frames.pop();
-                  var ni:int = 0;
+                  ni = 0;
                   while(ni < fr.argsVals.length)
                   {
                      fr.argsVals[ni] = consumeValue(fr.argsVals[ni],true);
@@ -1934,7 +2028,6 @@ package
                   return true;
                }
                return true;
-               break;
             case "Call":
                return tickCallExpr(fr,e);
             default:
@@ -1948,6 +2041,7 @@ package
       {
          if(fr.state == 0)
          {
+            setExecutionContext("调用：" + buildChainString(e.callee) + "(...)");
             fr.calleeNode = e.callee;
             fr.argsNodes = e.args;
             fr.argsVals = [];
@@ -2014,34 +2108,31 @@ package
             fr.calleeVal = readMemberValue(fr.thisObj,fr.memberName,buildChainString(e.callee));
             fr.state = 10;
          }
-         else
+         else if(fr.state == 2)
          {
-            if(fr.state == 2)
+            fr.thisObj = consumeValue(popValue(),true);
+            if(fr.thisObj === null || fr.thisObj === undefined)
             {
-               fr.thisObj = consumeValue(popValue(),true);
-               if(fr.thisObj === null || fr.thisObj === undefined)
-               {
-                  throw new Error("函数调用失败：索引接收对象为 null，目标 " + buildChainString(e.callee));
-               }
-               fr.state = 4;
-               _frames.push({
-                  "type":"EvalFrame",
-                  "node":fr.indexNode,
-                  "state":0
-               });
-               return true;
+               throw new Error("函数调用失败：索引接收对象为 null，目标 " + buildChainString(e.callee));
             }
-            if(fr.state == 4)
-            {
-               fr.indexValue = consumeValue(popValue(),true);
-               fr.calleeVal = readMemberValue(fr.thisObj,fr.indexValue,buildChainString(e.callee));
-               fr.state = 10;
-            }
-            else if(fr.state == 3)
-            {
-               fr.calleeVal = consumeValue(popValue(),true);
-               fr.state = 10;
-            }
+            fr.state = 4;
+            _frames.push({
+               "type":"EvalFrame",
+               "node":fr.indexNode,
+               "state":0
+            });
+            return true;
+         }
+         else if(fr.state == 4)
+         {
+            fr.indexValue = consumeValue(popValue(),true);
+            fr.calleeVal = readMemberValue(fr.thisObj,fr.indexValue,buildChainString(e.callee));
+            fr.state = 10;
+         }
+         else if(fr.state == 3)
+         {
+            fr.calleeVal = consumeValue(popValue(),true);
+            fr.state = 10;
          }
          if(fr.state == 10)
          {
@@ -2137,7 +2228,7 @@ package
       
       private function isUnboundRootName(name:String) : Boolean
       {
-         if(_builtinNames.hasOwnProperty(name.toLowerCase()))
+         if(_builtinNames.hasOwnProperty(String(name).toLowerCase()))
          {
             return false;
          }
@@ -2178,7 +2269,7 @@ package
       
       private function isUserFunction(v:*) : Boolean
       {
-         return v != null && v is Object && Object(v).hasOwnProperty("type") && Object(v)["type"] == "UserFunction";
+         return v != null && v is Object && Boolean(Object(v).hasOwnProperty("type")) && Object(v)["type"] == "UserFunction";
       }
       
       private function evalName(name:String) : *
@@ -2220,7 +2311,7 @@ package
          self = this;
          f = function(... args):*
          {
-            var valueDepth:int = int(self._valueStack.length);
+            var valueDepth:int = self._valueStack.length;
             var callFrame:Object = {
                "type":"CallUserFrame",
                "fn":fnObj,
@@ -2234,6 +2325,7 @@ package
             }
             if(self._isPaused)
             {
+               // 含 Delay 的脚本函数会在定时器回调中继续执行，当前同步调用先返回 null。
                return null;
             }
             if(self._valueStack.length > valueDepth)
@@ -2254,6 +2346,9 @@ package
       
       private function execAssign(left:Object, rv:*) : *
       {
+         var obj:*;
+         var base:*;
+         var idx:*;
          if(left.type == "Name")
          {
             envSet(left.value,rv);
@@ -2261,7 +2356,7 @@ package
          }
          if(left.type == "Member")
          {
-            var obj:* = evalChainOrObject(left.object);
+            obj = evalChainOrObject(left.object);
             if(obj === null || obj === undefined)
             {
                throw new Error("成员赋值失败：对象为 null，目标 " + buildChainString(left));
@@ -2271,12 +2366,12 @@ package
          }
          if(left.type == "Index")
          {
-            var base:* = evalChainOrObject(left.object);
+            base = evalChainOrObject(left.object);
             if(base === null || base === undefined)
             {
                throw new Error("索引赋值失败：对象为 null，目标 " + buildChainString(left));
             }
-            var idx:* = consumeValue(evalExprSync(left.index),true);
+            idx = consumeValue(evalExprSync(left.index),true);
             writeMemberValue(base,idx,rv,buildChainString(left));
             return rv;
          }
@@ -2318,7 +2413,6 @@ package
                   return null;
                }
                return readMemberValue(o,e.prop,buildChainString(e));
-               break;
             case "Index":
                var b:* = evalExprSync(e.object);
                if(isPkgChain(b))
@@ -2331,7 +2425,6 @@ package
                }
                var k:* = consumeValue(evalExprSync(e.index),true);
                return readMemberValue(b,k,buildChainString(e));
-               break;
             case "Unary":
                var av:* = consumeValue(evalExprSync(e.arg),true);
                return e.op == "!" ? !truthy(av) : -Number(av);
@@ -2356,7 +2449,6 @@ package
                   return constructClass(ctor as Class,avs);
                }
                throw new Error("new 目标不是 Class：" + describeValue(ctor));
-               break;
             case "ArrayLiteral":
                var arr:Array = [];
                for each(var el in e.elements)
@@ -2674,9 +2766,12 @@ package
       
       private function resolveCalleeValue(node:Object) : Object
       {
+         var v:*;
+         var base:*;
+         var key:*;
          if(node.type == "Name")
          {
-            var v:* = envGet(node.value);
+            v = envGet(node.value);
             if(isUserFunction(v))
             {
                return {
@@ -2706,7 +2801,7 @@ package
          }
          if(node.type == "Member")
          {
-            var base:* = consumeValue(evalExprSync(node.object),true);
+            base = consumeValue(evalExprSync(node.object),true);
             if(base === null || base === undefined)
             {
                return {
@@ -2729,7 +2824,7 @@ package
                   "thisObj":null
                };
             }
-            var key:* = consumeValue(evalExprSync(node.index),true);
+            key = consumeValue(evalExprSync(node.index),true);
             return {
                "fn":readMemberValue(base,key,buildChainString(node)),
                "thisObj":base
@@ -2744,33 +2839,42 @@ package
       
       private function invokeCallable(callable:*, thisObj:*, args:Array, targetText:String) : *
       {
-         if(!(callable is Function))
+         if(callable is Function)
          {
-            throw new Error("调用目标不是 Function：" + targetText + "，实际值 " + describeValue(callable));
+            try
+            {
+               return Function(callable).apply(thisObj,args);
+            }
+            catch(err:Error)
+            {
+               throw new Error("调用目标函数失败：" + targetText + "\n接收对象：" + describeValue(thisObj) + "\n" + err.name + ": " + err.message);
+            }
          }
-         try
-         {
-            return Function(callable).apply(thisObj,args);
-         }
-         catch(err:Error)
-         {
-            throw new Error("调用目标函数失败：" + targetText + "\n" + err.name + ": " + err.message);
-         }
+         throw new Error("调用目标不是 Function：" + targetText + "，实际值 " + describeValue(callable));
       }
       
       private function readMemberValue(base:*, key:*, targetText:String) : *
       {
-         var directError:Error;
-         var direct:*;
-         var namespaced:Object;
          if(base === null || base === undefined)
          {
             throw new Error("读取成员失败：对象为 null，目标 " + targetText);
          }
-         directError = null;
+         var directError:Error = null;
          try
          {
-            direct = base[key];
+            // 先通过 in 判断 trait；对 sealed 对象直接读取不存在属性会抛 #1069。
+            if(key in base)
+            {
+               return base[key];
+            }
+         }
+         catch(inErr:Error)
+         {
+            directError = inErr;
+         }
+         try
+         {
+            var direct:* = base[key];
             if(direct !== undefined)
             {
                return direct;
@@ -2782,7 +2886,7 @@ package
          }
          if(key is String)
          {
-            namespaced = tryReadNamespacedMember(base,String(key));
+            var namespaced:Object = tryReadNamespacedMember(base,String(key));
             if(Boolean(namespaced.found))
             {
                return namespaced.value;
@@ -2797,12 +2901,11 @@ package
       
       private function writeMemberValue(base:*, key:*, value:*, targetText:String) : void
       {
-         var directError:Error;
          if(base === null || base === undefined)
          {
             throw new Error("写入成员失败：对象为 null，目标 " + targetText);
          }
-         directError = null;
+         var directError:Error = null;
          try
          {
             base[key] = value;
@@ -2822,9 +2925,6 @@ package
       private function tryReadNamespacedMember(base:*, name:String) : Object
       {
          var info:XML;
-         var node:XML;
-         var uri:String;
-         var qn:QName;
          try
          {
             info = describeType(base);
@@ -2833,47 +2933,29 @@ package
          {
             return {"found":false};
          }
+         var node:XML;
+         var result:Object;
+         // describeType 中普通 public 成员的 uri 往往是空字符串。
+         // 旧版只尝试非空 uri，会把真实存在的 public 方法错误地当成不存在。
          for each(node in info..method)
          {
             if(String(node.@name) == name)
             {
-               uri = String(node.@uri);
-               if(uri.length > 0)
+               result = tryReadQNameMember(base,name,String(node.@uri));
+               if(Boolean(result.found))
                {
-                  try
-                  {
-                     qn = new QName(uri,name);
-                     return {
-                        "found":true,
-                        "value":base[qn]
-                     };
-                  }
-                  catch(err2:Error)
-                  {
-                  }
-                  continue;
+                  return result;
                }
             }
          }
          for each(node in info..accessor)
          {
-            if(String(node.@name) == name)
+            if(String(node.@name) == name && String(node.@access) != "writeonly")
             {
-               uri = String(node.@uri);
-               if(uri.length > 0 && String(node.@access) != "writeonly")
+               result = tryReadQNameMember(base,name,String(node.@uri));
+               if(Boolean(result.found))
                {
-                  try
-                  {
-                     qn = new QName(uri,name);
-                     return {
-                        "found":true,
-                        "value":base[qn]
-                     };
-                  }
-                  catch(err3:Error)
-                  {
-                  }
-                  continue;
+                  return result;
                }
             }
          }
@@ -2881,21 +2963,10 @@ package
          {
             if(String(node.@name) == name)
             {
-               uri = String(node.@uri);
-               if(uri.length > 0)
+               result = tryReadQNameMember(base,name,String(node.@uri));
+               if(Boolean(result.found))
                {
-                  try
-                  {
-                     qn = new QName(uri,name);
-                     return {
-                        "found":true,
-                        "value":base[qn]
-                     };
-                  }
-                  catch(err4:Error)
-                  {
-                  }
-                  continue;
+                  return result;
                }
             }
          }
@@ -2903,23 +2974,28 @@ package
          {
             if(String(node.@name) == name)
             {
-               uri = String(node.@uri);
-               if(uri.length > 0)
+               result = tryReadQNameMember(base,name,String(node.@uri));
+               if(Boolean(result.found))
                {
-                  try
-                  {
-                     qn = new QName(uri,name);
-                     return {
-                        "found":true,
-                        "value":base[qn]
-                     };
-                  }
-                  catch(err5:Error)
-                  {
-                  }
-                  continue;
+                  return result;
                }
             }
+         }
+         // 某些运行时不会在 describeType 中给 public trait 提供可用 uri，
+         // 再显式尝试 public QName。
+         return tryReadQNameMember(base,name,"");
+      }
+      
+      private function tryReadQNameMember(base:*, name:String, uri:String) : Object
+      {
+         var qn:QName;
+         try
+         {
+            qn = new QName(uri == null ? "" : uri,name);
+            return {"found":true,"value":base[qn]};
+         }
+         catch(err:Error)
+         {
          }
          return {"found":false};
       }
@@ -2927,9 +3003,6 @@ package
       private function tryWriteNamespacedMember(base:*, name:String, value:*) : Boolean
       {
          var info:XML;
-         var node:XML;
-         var uri:String;
-         var qn:QName;
          try
          {
             info = describeType(base);
@@ -2938,23 +3011,14 @@ package
          {
             return false;
          }
+         var node:XML;
          for each(node in info..accessor)
          {
             if(String(node.@name) == name && String(node.@access) != "readonly")
             {
-               uri = String(node.@uri);
-               if(uri.length > 0)
+               if(tryWriteQNameMember(base,name,String(node.@uri),value))
                {
-                  try
-                  {
-                     qn = new QName(uri,name);
-                     base[qn] = value;
-                     return true;
-                  }
-                  catch(err2:Error)
-                  {
-                  }
-                  continue;
+                  return true;
                }
             }
          }
@@ -2962,21 +3026,26 @@ package
          {
             if(String(node.@name) == name)
             {
-               uri = String(node.@uri);
-               if(uri.length > 0)
+               if(tryWriteQNameMember(base,name,String(node.@uri),value))
                {
-                  try
-                  {
-                     qn = new QName(uri,name);
-                     base[qn] = value;
-                     return true;
-                  }
-                  catch(err3:Error)
-                  {
-                  }
-                  continue;
+                  return true;
                }
             }
+         }
+         return tryWriteQNameMember(base,name,"",value);
+      }
+      
+      private function tryWriteQNameMember(base:*, name:String, uri:String, value:*) : Boolean
+      {
+         var qn:QName;
+         try
+         {
+            qn = new QName(uri == null ? "" : uri,name);
+            base[qn] = value;
+            return true;
+         }
+         catch(err:Error)
+         {
          }
          return false;
       }
@@ -3027,7 +3096,6 @@ package
                   return _importMap[node.value];
                }
                return node.value;
-               break;
             case "Index":
                return buildChainString(node.object) + "[" + exprToString(node.index) + "]";
             case "Member":
@@ -3073,7 +3141,7 @@ package
                return "(" + exprToString(e.left) + e.op + exprToString(e.right) + ")";
             case "ArrayLiteral":
                var arr:Array = [];
-               for each(var item in e.elements)
+               for each(var item:Object in e.elements)
                {
                   arr.push(exprToString(item));
                }
@@ -3095,15 +3163,15 @@ package
             s = s.replace(/\t/g,"\\t");
             return "\"" + s + "\"";
          }
-         switch(v)
+         if(v === null)
          {
-            case null:
-               return "null";
-            case undefined:
-               return "undefined";
-            default:
-               return String(v);
+            return "null";
          }
+         if(v === undefined)
+         {
+            return "undefined";
+         }
+         return String(v);
       }
       
       private function getRootName(node:Object) : String
@@ -3119,13 +3187,13 @@ package
             {
                cur = cur.callee;
             }
+            else if(cur.type == "New")
+            {
+               cur = cur.callee;
+            }
             else
             {
-               if(cur.type != "New")
-               {
-                  break;
-               }
-               cur = cur.callee;
+               break;
             }
          }
          if(cur && cur.type == "Name")
@@ -3142,32 +3210,6 @@ package
       
       private function evalExpression2(expr:String, logOnFail:Boolean) : *
       {
-         var domain:ApplicationDomain;
-         var firstSpecial:int;
-         var searchEnd:int;
-         var key:String;
-         var cached:Object;
-         var className:String;
-         var classEnd:int;
-         var lastOkName:String;
-         var lastOkEnd:int;
-         var i:int;
-         var p:int;
-         var cand:String;
-         var cls:Class;
-         var def:*;
-         var current:*;
-         var idx:int;
-         var ch:String;
-         var start:int;
-         var name:String;
-         var closeParen:int;
-         var argsPart:String;
-         var args:Array;
-         var fn:*;
-         var closeBracket:int;
-         var indexText:String;
-         var indexValue:*;
          expr = stripWhitespaceOutsideStrings(expr);
          if(expr == "")
          {
@@ -3177,13 +3219,13 @@ package
             }
             return null;
          }
-         domain = ApplicationDomain.currentDomain;
-         firstSpecial = findFirstOutsideStrings(expr,"([");
-         searchEnd = firstSpecial >= 0 ? firstSpecial : expr.length;
-         key = expr.substring(0,searchEnd);
-         cached = _classResolveCache[key];
-         className = null;
-         classEnd = 0;
+         var domain:ApplicationDomain = ApplicationDomain.currentDomain;
+         var firstSpecial:int = findFirstOutsideStrings(expr,"([");
+         var searchEnd:int = firstSpecial >= 0 ? firstSpecial : expr.length;
+         var key:String = expr.substring(0,searchEnd);
+         var cached:Object = _classResolveCache[key];
+         var className:String = null;
+         var classEnd:int = 0;
          if(cached != null && cached.className != null)
          {
             className = cached.className;
@@ -3191,17 +3233,17 @@ package
          }
          else
          {
-            lastOkName = null;
-            lastOkEnd = 0;
-            i = 0;
+            var lastOkName:String = null;
+            var lastOkEnd:int = 0;
+            var i:int = 0;
             while(true)
             {
-               p = expr.indexOf(".",i);
+               var p:int = int(expr.indexOf(".",i));
                if(p < 0 || p >= searchEnd)
                {
                   break;
                }
-               cand = expr.substring(0,p);
+               var cand:String = expr.substring(0,p);
                if(cand.length > 0 && hasDefinitionDeep(domain,cand))
                {
                   lastOkName = cand;
@@ -3236,10 +3278,10 @@ package
             }
             return null;
          }
-         cls = _classCache[className] as Class;
+         var cls:Class = _classCache[className] as Class;
          if(cls == null)
          {
-            def = getDefinitionDeep(domain,className);
+            var def:* = getDefinitionDeep(domain,className);
             if(!(def is Class))
             {
                if(logOnFail)
@@ -3251,14 +3293,14 @@ package
             cls = def as Class;
             _classCache[className] = cls;
          }
-         current = cls;
-         idx = classEnd;
+         var current:* = cls;
+         var idx:int = classEnd;
          while(idx < expr.length)
          {
-            ch = expr.charAt(idx);
+            var ch:String = expr.charAt(idx);
             if(ch == ".")
             {
-               start = ++idx;
+               var start:int = ++idx;
                while(idx < expr.length)
                {
                   ch = expr.charAt(idx);
@@ -3276,10 +3318,10 @@ package
                   }
                   return current;
                }
-               name = expr.substring(start,idx);
+               var name:String = expr.substring(start,idx);
                if(idx < expr.length && expr.charAt(idx) == "(")
                {
-                  closeParen = findMatchingDelimiter(expr,idx,"(",")");
+                  var closeParen:int = findMatchingDelimiter(expr,idx,"(",")");
                   if(closeParen < 0)
                   {
                      if(logOnFail)
@@ -3288,8 +3330,9 @@ package
                      }
                      return current;
                   }
-                  argsPart = expr.substring(idx + 1,closeParen);
-                  args = parseArgsExpression(argsPart);
+                  var argsPart:String = expr.substring(idx + 1,closeParen);
+                  var args:Array = parseArgsExpression(argsPart);
+                  var fn:*;
                   try
                   {
                      fn = readMemberValue(current,name,className + expr.substring(classEnd,idx));
@@ -3321,17 +3364,9 @@ package
                   }
                }
             }
-            else
+            else if(ch == "[")
             {
-               if(ch != "[")
-               {
-                  if(logOnFail)
-                  {
-                     CheatPanel.log("代码执行器：语法错误，期望成员访问符：" + expr.substring(idx));
-                  }
-                  return current;
-               }
-               closeBracket = findMatchingDelimiter(expr,idx,"[","]");
+               var closeBracket:int = findMatchingDelimiter(expr,idx,"[","]");
                if(closeBracket < 0)
                {
                   if(logOnFail)
@@ -3340,8 +3375,8 @@ package
                   }
                   return current;
                }
-               indexText = expr.substring(idx + 1,closeBracket);
-               indexValue = parseSingleArg(indexText);
+               var indexText:String = expr.substring(idx + 1,closeBracket);
+               var indexValue:* = parseSingleArg(indexText);
                try
                {
                   current = readMemberValue(current,indexValue,expr.substring(0,closeBracket + 1));
@@ -3355,6 +3390,14 @@ package
                   return null;
                }
                idx = closeBracket + 1;
+            }
+            else
+            {
+               if(logOnFail)
+               {
+                  CheatPanel.log("代码执行器：语法错误，期望成员访问符：" + expr.substring(idx));
+               }
+               return current;
             }
          }
          return current;
@@ -3385,7 +3428,7 @@ package
                   quote = "";
                }
             }
-            else if(ch == "\"" || ch == "\'")
+            else if(ch == "\"" || ch == "'")
             {
                quote = ch;
                out += ch;
@@ -3422,7 +3465,7 @@ package
                   quote = "";
                }
             }
-            else if(ch == "\"" || ch == "\'")
+            else if(ch == "\"" || ch == "'")
             {
                quote = ch;
             }
@@ -3459,7 +3502,7 @@ package
                   quote = "";
                }
             }
-            else if(ch == "\"" || ch == "\'")
+            else if(ch == "\"" || ch == "'")
             {
                quote = ch;
             }
@@ -3469,7 +3512,8 @@ package
             }
             else if(ch == closeChar)
             {
-               if(--depth == 0)
+               depth--;
+               if(depth == 0)
                {
                   return i;
                }
@@ -3514,7 +3558,7 @@ package
                   inStr = false;
                }
             }
-            else if(ch == "\"" || ch == "\'")
+            else if(ch == "\"" || ch == "'")
             {
                inStr = true;
                quoteChar = ch;
@@ -3595,19 +3639,20 @@ package
          {
             return undefined;
          }
-         if(s.charAt(0) == "\"" && s.charAt(s.length - 1) == "\"" || s.charAt(0) == "\'" && s.charAt(s.length - 1) == "\'")
+         if(s.charAt(0) == "\"" && s.charAt(s.length - 1) == "\"" || s.charAt(0) == "'" && s.charAt(s.length - 1) == "'")
          {
             var value:String = s.substring(1,s.length - 1);
             value = value.replace(/\\n/g,"\n");
             value = value.replace(/\\r/g,"\r");
             value = value.replace(/\\t/g,"\t");
             value = value.replace(/\\\"/g,"\"");
-            value = value.replace(/\\'/g,"\'");
-            return value.replace(/\\\\/g,"\\");
+            value = value.replace(/\\'/g,"'");
+            value = value.replace(/\\\\/g,"\\");
+            return value;
          }
          if(/^0[xX][0-9a-fA-F]+$/.test(s))
          {
-            return parseInt(s.substr(2),16);
+            return Number(parseInt(s.substr(2),16));
          }
          if(/^-?\d+$/.test(s))
          {

@@ -108,12 +108,18 @@ package
       private var _steps:int = 0;
       
       private const MAX_STEPS:int = 200000;
-      
+
       private var _importMap:Object = {};
+      
+      private var _importValueMap:Object = {};
       
       private var _classCache:Object = {};
       
       private var _classResolveCache:Object = {};
+      
+      // 使用 Dictionary 记录解释器自己创建的包名链包装对象。
+      // 不能对任意 Class/实例调用 hasOwnProperty，部分 AVM2 类对象会直接抛 Error #1069。
+      private var _pkgChainRegistry:Dictionary = new Dictionary(true);
       
       private var _knownDomains:Array = [];
       
@@ -133,12 +139,40 @@ package
          var o:Object = {};
          o[PKGCHAIN_TAG] = true;
          o.node = node;
+         _pkgChainRegistry[o] = true;
          return o;
       }
       
       private function isPkgChain(v:*) : Boolean
       {
-         return v != null && v is Object && Boolean(Object(v).hasOwnProperty(PKGCHAIN_TAG)) && Object(v)[PKGCHAIN_TAG] === true;
+         if(v === null || v === undefined)
+         {
+            return false;
+         }
+         try
+         {
+            return _pkgChainRegistry[v] === true;
+         }
+         catch(err:Error)
+         {
+         }
+         return false;
+      }
+      
+      private function safeHasOwnProperty(value:*, name:String) : Boolean
+      {
+         if(value === null || value === undefined)
+         {
+            return false;
+         }
+         try
+         {
+            return Object(value).hasOwnProperty(name);
+         }
+         catch(err:Error)
+         {
+         }
+         return false;
       }
       
       private function consumeValue(v:*, logOnFail:Boolean) : *
@@ -393,18 +427,29 @@ package
          }
          catch(err:Error)
          {
-            var detail:String = "代码执行器：执行过程中异常：\n" + err.name + ": " + err.message;
-            var context:String = getExecutionContext();
-            if(context.length > 0)
-            {
-               detail += "\n执行位置：" + context;
-            }
-            var stack:String = err.getStackTrace();
-            if(stack != null && stack.length > 0)
-            {
-               detail += "\n" + stack;
-            }
+            reportExecutionError(err);
+         }
+      }
+      
+      private function reportExecutionError(err:Error) : void
+      {
+         var detail:String = "代码执行器：执行过程中异常：\n" + err.name + ": " + err.message;
+         var context:String = getExecutionContext();
+         if(context.length > 0)
+         {
+            detail += "\n执行位置：" + context;
+         }
+         var stack:String = err.getStackTrace();
+         if(stack != null && stack.length > 0)
+         {
+            detail += "\n" + stack;
+         }
+         try
+         {
             CheatPanel.log(detail);
+         }
+         catch(logErr:Error)
+         {
          }
       }
       
@@ -413,9 +458,12 @@ package
          cmd = cmd.replace(/[\r\n]/g,"\n");
          _steps = 0;
          _isPaused = false;
+         _env = new Dictionary();
          _importMap = {};
+         _importValueMap = {};
          _classCache = {};
          _classResolveCache = {};
+         _pkgChainRegistry = new Dictionary(true);
          _currentExecContext = "";
          _lastExecContext = "";
          refreshKnownDomains();
@@ -442,9 +490,25 @@ package
          return _lastExecContext == null ? "" : _lastExecContext;
       }
       
+      private function safeNodeType(node:*) : String
+      {
+         if(node === null || node === undefined)
+         {
+            return "<null>";
+         }
+         try
+         {
+            return String(node["type"]);
+         }
+         catch(err:Error)
+         {
+         }
+         return "<未知>";
+      }
+      
       private function safeExprText(node:Object) : String
       {
-         if(node == null)
+         if(node === null || node === undefined)
          {
             return "";
          }
@@ -462,33 +526,44 @@ package
          catch(err2:Error)
          {
          }
-         return String(node.type);
+         return "<" + safeNodeType(node) + ">";
       }
       
+      // 诊断文本绝不能影响脚本执行。某些复杂成员链在格式化时可能触发
+      // AVM2 的 Error #1069，因此整个格式化过程必须完全隔离。
       private function statementText(node:Object) : String
       {
-         if(node == null)
+         if(node === null || node === undefined)
          {
             return "";
          }
-         switch(String(node.type))
+         var nodeType:String = safeNodeType(node);
+         try
          {
-            case "VarDecl":
-               return "var " + node.name + (node.init != null ? " = " + safeExprText(node.init) : "");
-            case "Assign":
-               return safeExprText(node.left) + " = " + safeExprText(node.right);
-            case "ExprStmt":
-               return safeExprText(node.expr);
-            case "If":
-               return "if (" + safeExprText(node.test) + ")";
-            case "While":
-               return "while (" + safeExprText(node.test) + ")";
-            case "FunctionDecl":
-               return "function " + node.name + "(...)";
-            case "Return":
-               return "return " + (node.arg != null ? safeExprText(node.arg) : "");
-            default:
-               return String(node.type);
+            switch(nodeType)
+            {
+               case "VarDecl":
+                  return "var " + String(node["name"]) +
+                     (node["init"] != null ? " = " + safeExprText(node["init"]) : "");
+               case "Assign":
+                  return safeExprText(node["left"]) + " = " + safeExprText(node["right"]);
+               case "ExprStmt":
+                  return safeExprText(node["expr"]);
+               case "If":
+                  return "if (" + safeExprText(node["test"]) + ")";
+               case "While":
+                  return "while (" + safeExprText(node["test"]) + ")";
+               case "FunctionDecl":
+                  return "function " + String(node["name"]) + "(...)";
+               case "Return":
+                  return "return " + (node["arg"] != null ? safeExprText(node["arg"]) : "");
+               default:
+                  return nodeType;
+            }
+         }
+         catch(err:Error)
+         {
+            return "<" + nodeType + "，诊断文本生成失败:" + err.name + ">";
          }
       }
       
@@ -778,7 +853,12 @@ package
                alias = expect(TK_ID).value;
             }
             expect(TK_PUNC,";");
-            _importMap[alias] = parts.join(".");
+            var importClassName:String = parts.join(".");
+            _importMap[alias] = importClassName;
+            // import 阶段只记录类名，不提前解析 Class。
+            // 完整脚本可能一次声明很多 import；提前解析并长期缓存 Class 对象，
+            // 会让后续静态成员操作依赖解析顺序。改为真正使用时再从当前
+            // ApplicationDomain 获取最新定义。
             return {"type":"ImportDecl"};
          }
          if(match(TK_PUNC,"{"))
@@ -1197,37 +1277,55 @@ package
          }
          step();
          var fr:Object = _frames[_frames.length - 1];
-         switch(fr.type)
+         if(fr === null || fr === undefined)
+         {
+            throw new Error("顶部执行帧为空");
+         }
+         var frameType:String = String(fr["type"]);
+         switch(frameType)
          {
             case "BlockFrame":
-               if(fr.i >= fr.stmts.length)
+               var stmts:Array = fr["stmts"] as Array;
+               var blockIndex:int = int(fr["i"]);
+               if(stmts == null)
+               {
+                  throw new Error("BlockFrame.stmts 不是数组");
+               }
+               if(blockIndex >= stmts.length)
                {
                   _frames.pop();
                }
                else
                {
+                  var nextStmt:Object = stmts[blockIndex];
+                  fr["i"] = blockIndex + 1;
+                  setExecutionContext("语句：" + statementText(nextStmt));
                   _frames.push({
                      "type":"StmtFrame",
-                     "node":fr.stmts[fr.i++],
+                     "node":nextStmt,
                      "state":0,
-                     "inFunction":fr.inFunction
+                     "inFunction":Boolean(fr["inFunction"])
                   });
                }
                break;
             case "StmtFrame":
+               setExecutionContext("语句：" + statementText(fr["node"]));
                tickStmtFrame(fr);
                break;
             case "WhileFrame":
+               setExecutionContext("while：" + safeExprText(fr["node"] != null ? fr["node"]["test"] : null));
                tickWhileFrame(fr);
                break;
             case "CallUserFrame":
+               setExecutionContext("脚本函数调用");
                tickCallUserFrame(fr);
                break;
             case "EvalFrame":
+               setExecutionContext("表达式：" + safeExprText(fr["node"]));
                tickEvalFrame(fr);
                break;
             default:
-               throw new Error("未知 frame 类型: " + fr.type);
+               throw new Error("未知 frame 类型: " + frameType);
          }
       }
       
@@ -1241,7 +1339,7 @@ package
       
       private function tickStmtFrame(fr:Object) : Boolean
       {
-         var s:Object = fr.node;
+         var s:Object = fr["node"];
          setExecutionContext("语句：" + statementText(s));
          switch(s.type)
          {
@@ -1260,101 +1358,33 @@ package
             case "VarDecl":
                if(fr.state == 0)
                {
-                  if(s.init != null)
+                  // 某些 AVM2/反编译编译环境中，对动态 AST 对象使用 s.init
+                  // 会被编译为不正确的 QName 访问并触发 Error #1069。
+                  // 使用字符串索引访问可确保读取的是对象字面量中的 public 动态字段。
+                  var varInit:* = s["init"];
+                  var varName:String = String(s["name"]);
+                  if(varInit != null)
                   {
-                     fr.state = 1;
-                     fr.name = s.name;
+                     fr["state"] = 1;
+                     fr["name"] = varName;
                      _frames.push({
                         "type":"EvalFrame",
-                        "node":s.init,
+                        "node":varInit,
                         "state":0
                      });
                      return true;
                   }
-                  envSet(s.name,undefined);
+                  envSet(varName,undefined);
                   _frames.pop();
                   return false;
                }
                var vv:* = consumeValue(popValue(),true);
-               envSet(fr.name,vv);
+               envSet(String(fr["name"]),vv);
                _frames.pop();
                return false;
                break;
             case "Assign":
-               if(fr.state == 0)
-               {
-                  fr.state = 1;
-                  fr.left = s.left;
-                  fr.right = s.right;
-                  _frames.push({
-                     "type":"EvalFrame",
-                     "node":fr.right,
-                     "state":0
-                  });
-                  return true;
-               }
-               if(fr.state == 1)
-               {
-                  fr.rval = consumeValue(popValue(),true);
-                  if(fr.left.type == "Name")
-                  {
-                     envSet(fr.left.value,fr.rval);
-                     _frames.pop();
-                     return false;
-                  }
-                  if(fr.left.type == "Member")
-                  {
-                     fr.state = 2;
-                     _frames.push({
-                        "type":"EvalFrame",
-                        "node":fr.left.object,
-                        "state":0
-                     });
-                     return true;
-                  }
-                  if(fr.left.type == "Index")
-                  {
-                     fr.state = 3;
-                     _frames.push({
-                        "type":"EvalFrame",
-                        "node":fr.left.object,
-                        "state":0
-                     });
-                     return true;
-                  }
-                  throw new Error("赋值左侧必须是变量、成员属性或索引属性");
-               }
-               if(fr.state == 2)
-               {
-                  fr.assignBase = consumeValue(popValue(),true);
-                  if(fr.assignBase === null || fr.assignBase === undefined)
-                  {
-                     throw new Error("成员赋值失败：对象为 null，目标 " + buildChainString(fr.left));
-                  }
-                  writeMemberValue(fr.assignBase,fr.left.prop,fr.rval,buildChainString(fr.left));
-                  _frames.pop();
-                  return false;
-               }
-               if(fr.state == 3)
-               {
-                  fr.assignBase = consumeValue(popValue(),true);
-                  if(fr.assignBase === null || fr.assignBase === undefined)
-                  {
-                     throw new Error("索引赋值失败：对象为 null，目标 " + buildChainString(fr.left));
-                  }
-                  fr.state = 4;
-                  _frames.push({
-                     "type":"EvalFrame",
-                     "node":fr.left.index,
-                     "state":0
-                  });
-                  return true;
-               }
-               fr.assignIndex = consumeValue(popValue(),true);
-               writeMemberValue(fr.assignBase,fr.assignIndex,fr.rval,buildChainString(fr.left));
-               _frames.pop();
-               return false;
-               break;
+               return tickAssignStmtFrame(fr,s);
             case "ExprStmt":
                if(fr.state == 0)
                {
@@ -1468,6 +1498,258 @@ package
             default:
                throw new Error("未知语句类型: " + s.type);
          }
+      }
+      
+      private function tickAssignStmtFrame(fr:Object, s:Object) : Boolean
+      {
+         var rawValue:*;
+         var left:Object;
+         var targetText:String;
+         try
+         {
+            if(int(fr["state"]) == 0)
+            {
+               fr["state"] = 1;
+               fr["left"] = s["left"];
+               fr["right"] = s["right"];
+               setExecutionContext("赋值右侧：" + safeExprText(fr["right"]));
+               _frames.push({
+                  "type":"EvalFrame",
+                  "node":fr["right"],
+                  "state":0
+               });
+               return true;
+            }
+
+            if(int(fr["state"]) == 1)
+            {
+               rawValue = popValue();
+               fr["rval"] = isPkgChain(rawValue) ? consumeValue(rawValue,true) : rawValue;
+               left = fr["left"];
+               targetText = safeExprText(left);
+               setExecutionContext("赋值：" + targetText);
+
+               if(left["type"] == "Name")
+               {
+                  envSet(String(left["value"]),fr["rval"]);
+                  _frames.pop();
+                  return false;
+               }
+
+               if(left["type"] == "Member")
+               {
+                  if(left["object"] != null && left["object"]["type"] == "Name")
+                  {
+                     var alias:String = String(left["object"]["value"]);
+                     if(_importMap.hasOwnProperty(alias))
+                     {
+                        var importedBase:* = resolveImportedDefinition(alias);
+                        if(importedBase === null || importedBase === undefined)
+                        {
+                           throw new Error("找不到导入类定义：" + String(_importMap[alias]));
+                        }
+                        writeMemberValue(importedBase,left["prop"],fr["rval"],targetText);
+                        _frames.pop();
+                        return false;
+                     }
+                  }
+
+                  var directBase:* = tryResolveDefinitionNodeDirect(left["object"]);
+                  if(directBase !== null && directBase !== undefined)
+                  {
+                     writeMemberValue(directBase,left["prop"],fr["rval"],targetText);
+                     _frames.pop();
+                     return false;
+                  }
+
+                  fr["state"] = 2;
+                  _frames.push({
+                     "type":"EvalFrame",
+                     "node":left["object"],
+                     "state":0
+                  });
+                  return true;
+               }
+
+               if(left["type"] == "Index")
+               {
+                  fr["state"] = 3;
+                  _frames.push({
+                     "type":"EvalFrame",
+                     "node":left["object"],
+                     "state":0
+                  });
+                  return true;
+               }
+
+               throw new Error("赋值左侧必须是变量、成员属性或索引属性");
+            }
+
+            left = fr["left"];
+            targetText = safeExprText(left);
+            if(int(fr["state"]) == 2)
+            {
+               rawValue = popValue();
+               fr["assignBase"] = isPkgChain(rawValue) ? consumeValue(rawValue,true) : rawValue;
+               if(fr["assignBase"] === null || fr["assignBase"] === undefined)
+               {
+                  throw new Error("成员赋值对象为 null：" + safeExprText(left["object"]));
+               }
+               writeMemberValue(fr["assignBase"],left["prop"],fr["rval"],targetText);
+               _frames.pop();
+               return false;
+            }
+
+            if(int(fr["state"]) == 3)
+            {
+               rawValue = popValue();
+               fr["assignBase"] = isPkgChain(rawValue) ? consumeValue(rawValue,true) : rawValue;
+               if(fr["assignBase"] === null || fr["assignBase"] === undefined)
+               {
+                  throw new Error("索引赋值对象为 null：" + safeExprText(left["object"]));
+               }
+               fr["state"] = 4;
+               _frames.push({
+                  "type":"EvalFrame",
+                  "node":left["index"],
+                  "state":0
+               });
+               return true;
+            }
+
+            rawValue = popValue();
+            fr["assignIndex"] = isPkgChain(rawValue) ? consumeValue(rawValue,true) : rawValue;
+            writeMemberValue(fr["assignBase"],fr["assignIndex"],fr["rval"],targetText);
+            _frames.pop();
+            return false;
+         }
+         catch(err:Error)
+         {
+            targetText = fr != null && fr["left"] != null ? safeExprText(fr["left"]) : safeExprText(s["left"]);
+            throw new Error("赋值失败：" + targetText + "\n" + err.name + ": " + err.message);
+         }
+      }
+      
+      private function resolveImportedDefinition(alias:String) : *
+      {
+         if(alias == null || !_importMap.hasOwnProperty(alias))
+         {
+            return null;
+         }
+
+         // 首次真正使用时解析并缓存定义。这样同一份长脚本在多次 Delay、
+         // 场景切换和模块加载之后，仍然使用开头已经验证可访问的同一个 Class。
+         var cached:* = null;
+         try
+         {
+            cached = _importValueMap[alias];
+         }
+         catch(cacheErr:Error)
+         {
+         }
+         if(cached !== null && cached !== undefined)
+         {
+            return cached;
+         }
+
+         var className:String = String(_importMap[alias]);
+         var def:* = resolveDefinitionByClassName(className);
+         if(def !== null && def !== undefined)
+         {
+            try
+            {
+               _importValueMap[alias] = def;
+            }
+            catch(storeErr:Error)
+            {
+            }
+         }
+         return def;
+      }
+
+      private function resolveDefinitionByClassName(className:String) : *
+      {
+         if(className == null || className.length == 0)
+         {
+            return null;
+         }
+         var def:* = null;
+         try
+         {
+            def = getDefinitionByName(className);
+         }
+         catch(getByNameErr:Error)
+         {
+         }
+         if(def !== null && def !== undefined)
+         {
+            return def;
+         }
+         try
+         {
+            def = getDefinitionDeep(ApplicationDomain.currentDomain,className);
+         }
+         catch(currentDomainErr:Error)
+         {
+         }
+         if(def !== null && def !== undefined)
+         {
+            return def;
+         }
+         if(_knownDomains.length == 0)
+         {
+            refreshKnownDomains();
+         }
+         var i:int = 0;
+         while(i < _knownDomains.length)
+         {
+            var domain:ApplicationDomain = _knownDomains[i] as ApplicationDomain;
+            if(domain != null)
+            {
+               try
+               {
+                  if(domain.hasDefinition(className))
+                  {
+                     def = domain.getDefinition(className);
+                     if(def !== null && def !== undefined)
+                     {
+                        return def;
+                     }
+                  }
+               }
+               catch(domainErr:Error)
+               {
+               }
+            }
+            i++;
+         }
+         return null;
+      }
+
+      private function tryResolveDefinitionNodeDirect(node:Object) : *
+      {
+         if(node == null)
+         {
+            return null;
+         }
+         var className:String = buildChainString(node);
+         if(className == null || className.length == 0 || className.indexOf("(") >= 0 || className.indexOf("[") >= 0)
+         {
+            return null;
+         }
+         var def:* = null;
+         try
+         {
+            def = getDefinitionByName(className);
+         }
+         catch(err:Error)
+         {
+         }
+         if(def !== null && def !== undefined)
+         {
+            return def;
+         }
+         return getDefinitionDeep(ApplicationDomain.currentDomain,className);
       }
       
       private function tickWhileFrame(fr:Object) : Boolean
@@ -1888,9 +2170,18 @@ package
                pushValue(evalBinary(fr.op,a,b));
                return false;
             case "Name":
-               _frames.pop();
-               pushValue(evalName(e.value));
-               return false;
+               try
+               {
+                  var resolvedNameValue:* = evalName(e.value);
+                  _frames.pop();
+                  pushValue(resolvedNameValue);
+                  return false;
+               }
+               catch(nameResolveErr:Error)
+               {
+                  throw new Error("解析名称失败：" + e.value + "\n" + nameResolveErr.name + ": " + nameResolveErr.message);
+               }
+               break;
             case "Member":
                if(fr.state == 0)
                {
@@ -2269,7 +2560,18 @@ package
       
       private function isUserFunction(v:*) : Boolean
       {
-         return v != null && v is Object && Boolean(Object(v).hasOwnProperty("type")) && Object(v)["type"] == "UserFunction";
+         if(!safeHasOwnProperty(v,"type"))
+         {
+            return false;
+         }
+         try
+         {
+            return Object(v)["type"] == "UserFunction";
+         }
+         catch(err:Error)
+         {
+         }
+         return false;
       }
       
       private function evalName(name:String) : *
@@ -2280,7 +2582,12 @@ package
          }
          if(_importMap.hasOwnProperty(name))
          {
-            return evalExpression2(_importMap[name],true);
+            var importedDef:* = resolveImportedDefinition(name);
+            if(importedDef !== null && importedDef !== undefined)
+            {
+               return importedDef;
+            }
+            throw new Error("找不到导入类定义：" + String(_importMap[name]));
          }
          var v:* = envGet(name);
          if(v !== undefined)
@@ -2304,9 +2611,18 @@ package
       {
          var self:CheatCodeExecutorControl;
          var f:Function;
-         if(fnObj != null && fnObj is Object && Object(fnObj).hasOwnProperty("__wrapped") && Object(fnObj)["__wrapped"] is Function)
+         if(safeHasOwnProperty(fnObj,"__wrapped"))
          {
-            return Object(fnObj)["__wrapped"] as Function;
+            try
+            {
+               if(Object(fnObj)["__wrapped"] is Function)
+               {
+                  return Object(fnObj)["__wrapped"] as Function;
+               }
+            }
+            catch(err:Error)
+            {
+            }
          }
          self = this;
          f = function(... args):*
@@ -2551,7 +2867,17 @@ package
          setTimeout(function():void
          {
             self._isPaused = false;
-            self.pump();
+            try
+            {
+               self.pump();
+            }
+            catch(err:Error)
+            {
+               self.reportExecutionError(err);
+               self._frames = [];
+               self._runningAst = null;
+               self._isPaused = false;
+            }
          },ms);
          return null;
       }
@@ -2841,9 +3167,16 @@ package
       {
          if(callable is Function)
          {
+            var fn:Function = callable as Function;
+            if(fn == null)
+            {
+               throw new Error("调用目标无法转换为 Function：" + targetText + "，实际值 " + describeValue(callable));
+            }
             try
             {
-               return Function(callable).apply(thisObj,args);
+               // 不要使用 Function(callable)。在部分 AVM2 环境中，这会被当成
+               // Function 构造器调用并触发 EvalError #1066。
+               return fn.apply(thisObj,args);
             }
             catch(err:Error)
             {
@@ -2906,6 +3239,7 @@ package
             throw new Error("写入成员失败：对象为 null，目标 " + targetText);
          }
          var directError:Error = null;
+         var fallbackError:Error = null;
          try
          {
             base[key] = value;
@@ -2915,11 +3249,36 @@ package
          {
             directError = err;
          }
-         if(key is String && tryWriteNamespacedMember(base,String(key),value))
+         if(key is String)
          {
-            return;
+            try
+            {
+               if(tryWriteNamespacedMember(base,String(key),value))
+               {
+                  return;
+               }
+            }
+            catch(err2:Error)
+            {
+               fallbackError = err2;
+            }
          }
-         throw new Error("写入成员失败：" + targetText + " = " + literalToString(value) + "，对象类型 " + describeValue(base) + "\n" + (directError != null ? directError.name + ": " + directError.message : "未知错误") + "\n该 setter 可能不是 public，或属于其他命名空间。");
+         var detail:String = "写入成员失败：" + targetText + " = " + literalToString(value) +
+            "，对象类型 " + describeValue(base);
+         if(directError != null)
+         {
+            detail += "\n直接写入：" + directError.name + ": " + directError.message;
+         }
+         if(fallbackError != null)
+         {
+            detail += "\n命名空间回退：" + fallbackError.name + ": " + fallbackError.message;
+         }
+         if(key is String)
+         {
+            detail += "\n运行时成员信息：" + describeMemberCandidates(base,String(key));
+         }
+         detail += "\n若成员信息中没有该名称，它可能不是 public/static，或属于不可访问的命名空间。";
+         throw new Error(detail);
       }
       
       private function tryReadNamespacedMember(base:*, name:String) : Object
@@ -2935,55 +3294,18 @@ package
          }
          var node:XML;
          var result:Object;
-         // describeType 中普通 public 成员的 uri 往往是空字符串。
-         // 旧版只尝试非空 uri，会把真实存在的 public 方法错误地当成不存在。
-         for each(node in info..method)
+         var uris:Array = collectMemberNamespaceUris(info,name,false);
+         var i:int = 0;
+         while(i < uris.length)
          {
-            if(String(node.@name) == name)
+            result = tryReadQNameMember(base,name,String(uris[i]));
+            if(Boolean(result.found))
             {
-               result = tryReadQNameMember(base,name,String(node.@uri));
-               if(Boolean(result.found))
-               {
-                  return result;
-               }
+               return result;
             }
+            i++;
          }
-         for each(node in info..accessor)
-         {
-            if(String(node.@name) == name && String(node.@access) != "writeonly")
-            {
-               result = tryReadQNameMember(base,name,String(node.@uri));
-               if(Boolean(result.found))
-               {
-                  return result;
-               }
-            }
-         }
-         for each(node in info..variable)
-         {
-            if(String(node.@name) == name)
-            {
-               result = tryReadQNameMember(base,name,String(node.@uri));
-               if(Boolean(result.found))
-               {
-                  return result;
-               }
-            }
-         }
-         for each(node in info..constant)
-         {
-            if(String(node.@name) == name)
-            {
-               result = tryReadQNameMember(base,name,String(node.@uri));
-               if(Boolean(result.found))
-               {
-                  return result;
-               }
-            }
-         }
-         // 某些运行时不会在 describeType 中给 public trait 提供可用 uri，
-         // 再显式尝试 public QName。
-         return tryReadQNameMember(base,name,"");
+         return {"found":false};
       }
       
       private function tryReadQNameMember(base:*, name:String, uri:String) : Object
@@ -3011,14 +3333,51 @@ package
          {
             return false;
          }
+         var uris:Array = collectMemberNamespaceUris(info,name,true);
+         var i:int = 0;
+         while(i < uris.length)
+         {
+            if(tryWriteQNameMember(base,name,String(uris[i]),value))
+            {
+               return true;
+            }
+            i++;
+         }
+         return false;
+      }
+      
+      private function collectMemberNamespaceUris(info:XML, name:String, writableOnly:Boolean) : Array
+      {
+         var result:Array = [];
+         var seen:Object = {};
+         var addUri:Function = function(value:*):void
+         {
+            var uri:String = value == null ? "" : String(value);
+            if(!seen.hasOwnProperty(uri))
+            {
+               seen[uri] = true;
+               result.push(uri);
+            }
+         };
          var node:XML;
+         if(!writableOnly)
+         {
+            for each(node in info..method)
+            {
+               if(String(node.@name) == name)
+               {
+                  addUri(String(node.@uri));
+               }
+            }
+         }
          for each(node in info..accessor)
          {
-            if(String(node.@name) == name && String(node.@access) != "readonly")
+            if(String(node.@name) == name)
             {
-               if(tryWriteQNameMember(base,name,String(node.@uri),value))
+               var access:String = String(node.@access);
+               if(writableOnly ? access != "readonly" : access != "writeonly")
                {
-                  return true;
+                  addUri(String(node.@uri));
                }
             }
          }
@@ -3026,13 +3385,48 @@ package
          {
             if(String(node.@name) == name)
             {
-               if(tryWriteQNameMember(base,name,String(node.@uri),value))
+               addUri(String(node.@uri));
+            }
+         }
+         if(!writableOnly)
+         {
+            for each(node in info..constant)
+            {
+               if(String(node.@name) == name)
                {
-                  return true;
+                  addUri(String(node.@uri));
                }
             }
          }
-         return tryWriteQNameMember(base,name,"",value);
+         // 普通 public trait 常使用空 URI。
+         addUri("");
+         // 某些由反编译器还原的静态 trait 使用类所在包作为 URI。
+         addTypePackageUri(result,seen,String(info.@name));
+         addTypePackageUri(result,seen,String(info.factory.@type));
+         return result;
+      }
+      
+      private function addTypePackageUri(result:Array, seen:Object, typeName:String) : void
+      {
+         if(typeName == null || typeName.length == 0)
+         {
+            return;
+         }
+         var split:int = typeName.lastIndexOf("::");
+         if(split < 0)
+         {
+            split = typeName.lastIndexOf(".");
+         }
+         if(split <= 0)
+         {
+            return;
+         }
+         var uri:String = typeName.substring(0,split);
+         if(!seen.hasOwnProperty(uri))
+         {
+            seen[uri] = true;
+            result.push(uri);
+         }
       }
       
       private function tryWriteQNameMember(base:*, name:String, uri:String, value:*) : Boolean
@@ -3050,6 +3444,54 @@ package
          return false;
       }
       
+      private function describeMemberCandidates(base:*, name:String) : String
+      {
+         var info:XML;
+         try
+         {
+            info = describeType(base);
+         }
+         catch(err:Error)
+         {
+            return "describeType 失败：" + err.name + ": " + err.message;
+         }
+         var parts:Array = [];
+         var node:XML;
+         for each(node in info..accessor)
+         {
+            if(String(node.@name) == name)
+            {
+               parts.push("accessor(access=" + String(node.@access) + ", uri='" + String(node.@uri) + "')");
+            }
+         }
+         for each(node in info..variable)
+         {
+            if(String(node.@name) == name)
+            {
+               parts.push("variable(uri='" + String(node.@uri) + "', type='" + String(node.@type) + "')");
+            }
+         }
+         for each(node in info..constant)
+         {
+            if(String(node.@name) == name)
+            {
+               parts.push("constant(uri='" + String(node.@uri) + "', type='" + String(node.@type) + "')");
+            }
+         }
+         for each(node in info..method)
+         {
+            if(String(node.@name) == name)
+            {
+               parts.push("method(uri='" + String(node.@uri) + "')");
+            }
+         }
+         if(parts.length == 0)
+         {
+            return "describeType 未发现名为 '" + name + "' 的 trait";
+         }
+         return parts.join(", ");
+      }
+      
       private function describeValue(value:*) : String
       {
          if(value === null)
@@ -3060,14 +3502,24 @@ package
          {
             return "undefined";
          }
+         var className:String = "?";
+         var valueText:String = "?";
          try
          {
-            return "[" + getQualifiedClassName(value) + "] " + String(value);
+            className = getQualifiedClassName(value);
          }
-         catch(err:Error)
+         catch(classErr:Error)
          {
-            return String(value);
          }
+         try
+         {
+            valueText = String(value);
+         }
+         catch(stringErr:Error)
+         {
+            valueText = "<无法转换为字符串>";
+         }
+         return "[" + className + "] " + valueText;
       }
       
       private function evalByReflection(node:Object) : *
